@@ -143,6 +143,22 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         })
     }
 
+    pub async fn handle_multiple_client_requests(
+        &mut self,
+        client: Arc<Client>,
+        requests: Vec<Request>,
+    ) -> Vec<Result<Value, super::error::Error>> {
+        let futures: Vec<_> = requests
+            .into_iter()
+            .map(|request| {
+                let client_clone = client.clone();
+                async move { self.handle_client_request(client_clone, request).await }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await
+    }
+
     /// Handle a request from a client. All methods are defined in the electrum
     /// protocol.
     pub async fn handle_client_request(
@@ -539,6 +555,36 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         self.wallet_notify(&transactions).await;
     }
 
+    async fn send_response_to_client(
+        client: Arc<Client>,
+        result: Result<Value, crate::error::Error>,
+        id: Value,
+    ) -> Result<(), crate::error::Error> {
+        match result {
+            Ok(res) => {
+                client
+                    .write(serde_json::to_string(&res).unwrap().as_bytes())
+                    .await?;
+            }
+            Err(_) => {
+                let res = json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32000,
+                        "message": "Internal JSON-RPC error.",
+                        "data": null
+                    },
+                    "id": id
+                });
+                client
+                    .write(serde_json::to_string(&res).unwrap().as_bytes())
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handles each kind of Message
     async fn handle_message(&mut self, message: Message) -> Result<(), crate::error::Error> {
         match message {
@@ -548,33 +594,34 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 
             Message::Message((client, msg)) => {
                 trace!("Message: {msg}");
-                if let Ok(req) = serde_json::from_str::<Request>(msg.as_str()) {
-                    let client = self.clients.get(&client);
-                    if client.is_none() {
-                        error!("Client sent a message but is not listed as client");
-                        return Ok(());
-                    }
-                    let client = client.unwrap().to_owned();
-                    let id = req.id.to_owned();
-                    let res = self.handle_client_request(client.clone(), req).await;
 
-                    if let Ok(res) = res {
-                        client
-                            .write(serde_json::to_string(&res).unwrap().as_bytes())
-                            .await?;
-                    } else {
-                        let res = json!({
-                            "jsonrpc": "2.0",
-                            "error": {
-                                "code": -32000,
-                                "message": "Internal JSON-RPC error.",
-                                "data": null
-                            },
-                            "id": id
-                        });
-                        client
-                            .write(serde_json::to_string(&res).unwrap().as_bytes())
-                            .await?;
+                let value: Value = serde_json::from_str(&msg)?;
+
+                let client = self.clients.get(&client);
+                if client.is_none() {
+                    error!("Client sent a message but is not listed as client");
+                    return Ok(());
+                }
+                let client = client.unwrap().to_owned();
+
+                match value {
+                    Value::Array(_) => {
+                        if let Ok(reqs) = serde_json::from_str::<Vec<Request>>(msg.as_str()) {
+                            let ids: Vec<_> = reqs.iter().map(|req| req.id.to_owned()).collect();
+                            let ids_value = serde_json::Value::Array(ids);
+                            let res = self
+                                .handle_multiple_client_requests(client.clone(), reqs)
+                                .await;
+                            Self::send_response_to_client(client, res, ids_value).await?;
+                        }
+                    }
+
+                    _ => {
+                        if let Ok(req) = serde_json::from_str::<Request>(msg.as_str()) {
+                            let id = req.id.to_owned();
+                            let res = self.handle_client_request(client.clone(), req).await;
+                            Self::send_response_to_client(client, res, id).await?;
+                        }
                     }
                 }
             }
